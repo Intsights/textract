@@ -1,0 +1,28 @@
+name: Packages / TC Textract
+on:
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: 'Should deploy (n/y)'
+        default: 'n'
+        required: false
+  pull_request:
+    paths:
+      - '.github/workflows/shared_package_deploy.yml'
+  push:
+    branches:
+      - master
+      - next-version
+    paths:
+      - '.github/workflows/shared_package_deploy.yml'
+jobs:
+  build:
+    uses: ./.github/workflows/shared_package_deploy.yml
+    with:
+      package-path: packages/tcapis/
+      coverage-required: 0
+    secrets:
+      gcloud-json-key: ${{ secrets.GCLOUD_JSON_KEY }}
+      slack-webhook-url-prod: ${{ secrets.SLACK_WEBHOOK_URL_PROD }}
+      slack-webhook-url-dev: ${{ secrets.SLACK_WEBHOOK_URL_DEV }}
+      snyk-token: ${{ secrets.SNYK_TOKEN }}

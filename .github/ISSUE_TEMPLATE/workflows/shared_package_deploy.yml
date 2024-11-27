@@ -1,0 +1,427 @@
+name: Shared / Package / Deployment
+on:
+  workflow_call:
+    inputs:
+      package-path:
+        required: true
+        type: string
+        description: path to package directory
+      coverage-required:
+        type: number
+        default: 0
+        description: minimum coverage required on this package
+      pytest-java-classpath:
+        required: false
+        type: string
+        description: class path for packages that required specific java modules
+      python-version:
+        type: string
+        default: '3.10'
+        description: Python version
+      poetry-version:
+        type: string
+        default: '1.5.1'
+        description: Poetry version
+    secrets:
+      gcloud-json-key:
+        required: true
+      slack-webhook-url-prod:
+        required: true
+      slack-webhook-url-dev:
+        required: true
+      snyk-token:
+        required: true
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  snyk_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - uses: ./.github/actions/snyk_poetry_test
+        with:
+          app-name: ${{ inputs.package-path }}
+          app-path: ${{ inputs.package-path }}
+          snyk-token: ${{ secrets.snyk-token }}
+  start_notification:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    outputs:
+      should_deploy: ${{ steps.vars.outputs.should_deploy }}
+      start_timestamp:  ${{ steps.vars.outputs.start_timestamp }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+    - name: Define variables
+      id: vars
+      run: |
+        set -v
+
+        if [ ! -z "${GITHUB_BASE_REF}" ] ; then
+          # pull_request event
+          branch_name="${GITHUB_HEAD_REF}"
+        else
+          # push event
+          branch_name="${GITHUB_REF##*/}"
+        fi
+
+        if [[ ${branch_name} == 'next-version' ]] ; then
+          should_deploy=${{ github.event_name == 'push' || github.event.inputs.deploy == 'y' }}
+        else
+          should_deploy=false
+        fi
+
+        echo "Branch: ${branch_name}"
+        echo "should_deploy=${should_deploy}" >> $GITHUB_OUTPUT
+        echo "start_timestamp=$(date +%s)" >> $GITHUB_OUTPUT
+    - name: Start notification
+      uses: 8398a7/action-slack@v3
+      if: |
+        always() &&
+        steps.vars.outputs.should_deploy == 'true'
+      with:
+        status: custom
+        fields: workflow,message,author
+        custom_payload: |
+          {
+            attachments: [{
+              color: '#4287f5',
+              pretext: `*App ${process.env.AS_WORKFLOW} \`started\`* :rocket:`,
+              fields: [
+                {
+                  value: `*Author:* ${process.env.AS_AUTHOR}`,
+                  short: false,
+                },
+                {
+                  value: `*Commit:* ${process.env.AS_MESSAGE}`,
+                  short: false,
+                },
+              ]
+            }]
+          }
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url-prod }}
+  check_version:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'next-version'
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+    - name: Skip if new package
+      run: |
+        git fetch origin ${{ github.event.pull_request.base.ref }}
+
+        git rev-parse --verify "origin/${{ github.event.pull_request.base.ref }}:${{ inputs.package-path }}" > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+          exit 0
+        fi
+    - name: Check version bump
+      run: |
+        git fetch origin ${{ github.event.pull_request.base.ref }}
+        
+        VERSION_BASE=$(git show "origin/${{ github.event.pull_request.base.ref }}:${{ inputs.package-path }}pyproject.toml" | grep -i "^version" | head -1 | awk -F'"' '{print $2}')
+        VERSION_HEAD=$(grep -i "^version" pyproject.toml | head -1 | awk -F'"' '{print $2}')
+        
+        echo "Base version: $VERSION_BASE"
+        echo "Head version: $VERSION_HEAD"
+        
+        function version_gt() { test "$(echo -e "$1\n$2" | sort -V | head -n 1)" != "$1"; }
+
+        if version_gt $VERSION_BASE $VERSION_HEAD || [ "$VERSION_BASE" == "$VERSION_HEAD" ]; then
+          echo "New version is not greater than the old version."
+          exit 1
+        fi
+  lint:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    strategy:
+      matrix:
+        include:
+          - command: "isort"
+            args: "--check  --diff"
+            requirements: "isort"
+          - command: "flake8"
+            args: ""
+            requirements: "flake8 flake8_intsights"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version:  ${{ inputs.python-version }}
+      - name: Install dependencies
+        run: |
+          python3 -m pip install ${{ matrix.requirements }}
+      - name: Run ${{ matrix.command }}
+        run: |
+          python3 -m ${{ matrix.command }} ${{matrix.args}} .
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version:  ${{ inputs.python-version }}
+      - name: Install poetry
+        run: |
+          sudo apt-get update
+          curl -sSL https://install.python-poetry.org | python - --version=${{ inputs.poetry-version }} && \
+          export PATH="${PATH}:/root/.local/bin"
+      - name: Setup cache
+        id: poetry-cache
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-cache-${{ runner.os }}-${{ hashFiles(format('{0}poetry.lock', inputs.package-path)) }}
+      - name: Setup GCloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.gcloud-json-key }}
+          project_id: intsights
+      - name: Setup Google Authentication
+        id: 'auth'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          credentials_json: '${{ secrets.gcloud-json-key }}'
+      - name: Pre install
+        run: test -f pre-install.sh && sh ./pre-install.sh || echo No pre-install script
+      - name: Install dependencies
+        run: |
+          GOOGLE_APPLICATION_CREDENTIALS=${{ steps.auth.outputs.credentials_file_path }}
+          poetry self add keyrings.google-artifactregistry-auth
+          poetry install --all-extras
+          poetry run pip install pytest-github-actions-annotate-failures
+          poetry run pip install pytest-cov
+      - name: Post install
+        run: test -f post-install.sh && sh ./post-install.sh || echo No post-install script
+      - name: Test
+        env:
+          PYTEST_RUN_PATH: ${{ inputs.package-path }}
+          CLASSPATH: ${{inputs.pytest-java-classpath }}
+        run: |
+          poetry run pytest -v --cov=. --cov-fail-under=${{inputs.coverage-required}}
+  mypy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version:  ${{ inputs.python-version }}
+      - name: Install poetry
+        run: |
+          sudo apt-get update
+          curl -sSL https://install.python-poetry.org | python - --version=${{ inputs.poetry-version }} && \
+          export PATH="${PATH}:/root/.local/bin"
+      - name: Setup cache
+        id: poetry-cache
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-cache-${{ runner.os }}-${{ hashFiles(format('{0}poetry.lock', inputs.package-path)) }}
+      - name: Setup GCloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.gcloud-json-key }}
+          project_id: intsights
+      - name: Setup Google Authentication
+        id: 'auth'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          credentials_json: '${{ secrets.gcloud-json-key }}'
+      - name: Pre install
+        run: test -f pre-install.sh && sh ./pre-install.sh || echo No pre-install script
+      - name: Install dependencies
+        run: |
+          GOOGLE_APPLICATION_CREDENTIALS=${{ steps.auth.outputs.credentials_file_path }}
+          poetry self add keyrings.google-artifactregistry-auth
+          poetry install --all-extras
+      - name: Post install
+        run: test -f post-install.sh && sh ./post-install.sh || echo No post-install script
+      - name: Mypy
+        run: |
+          poetry run mypy .
+  black:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version:  ${{ inputs.python-version }}
+      - name: Install poetry
+        run: |
+          sudo apt-get update
+          curl -sSL https://install.python-poetry.org | python - --version=${{ inputs.poetry-version }} && \
+          export PATH="${PATH}:/root/.local/bin"
+      - name: Setup cache
+        id: poetry-cache
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-cache-${{ runner.os }}-${{ hashFiles(format('{0}poetry.lock', inputs.package-path)) }}
+      - name: Setup GCloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.gcloud-json-key }}
+          project_id: intsights
+      - name: Setup Google Authentication
+        id: 'auth'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          credentials_json: '${{ secrets.gcloud-json-key }}'
+      - name: Pre install
+        run: test -f pre-install.sh && sh ./pre-install.sh || echo No pre-install script
+      - name: Install dependencies
+        run: |
+          GOOGLE_APPLICATION_CREDENTIALS=${{ steps.auth.outputs.credentials_file_path }}
+          poetry self add keyrings.google-artifactregistry-auth
+          poetry install --all-extras
+      - name: Post install
+        run: test -f post-install.sh && sh ./post-install.sh || echo No post-install script
+      - name: black
+        run: |
+          poetry run black . --check
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - start_notification
+      - lint
+      - test
+      - mypy
+      - black
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version:  ${{ inputs.python-version }}
+      - name: Install poetry
+        run: |
+          sudo apt-get update
+          curl -sSL https://install.python-poetry.org | python - --version=${{ inputs.poetry-version }} && \
+          export PATH="${PATH}:/root/.local/bin"
+      - name: Pre install
+        run: test -f pre-install.sh && sh ./pre-install.sh || echo No pre-install script
+      - name: Setup cache
+        id: poetry-cache
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-cache-${{ runner.os }}-${{ hashFiles(format('{0}poetry.lock', inputs.package-path)) }}
+      - name: Setup GCloud
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.gcloud-json-key }}
+          project_id: intsights
+      - name: Setup Google Authentication
+        id: 'auth'
+        uses: 'google-github-actions/auth@v1'
+        with:
+          credentials_json: '${{ secrets.gcloud-json-key }}'
+      - name: Install dependencies
+        run: |
+          GOOGLE_APPLICATION_CREDENTIALS=${{ steps.auth.outputs.credentials_file_path }}
+          poetry self add keyrings.google-artifactregistry-auth
+          poetry install --all-extras
+      - name: Post install
+        run: test -f post-install.sh && sh ./post-install.sh || echo No post-install script
+      - name: Build
+        run: |
+          poetry build
+      - name: Release
+        if: ${{ needs.start_notification.outputs.should_deploy == 'true' }}
+        run: |
+          GOOGLE_APPLICATION_CREDENTIALS=${{ steps.auth.outputs.credentials_file_path }}
+          poetry config repositories.pytc https://us-central1-python.pkg.dev/intsights/pytc
+          poetry publish --repository=pytc
+  finish_notification:
+    runs-on: ubuntu-latest
+    if: always() && needs.start_notification.outputs.should_deploy == 'true'
+    defaults:
+      run:
+        working-directory: ${{ inputs.package-path }}
+    needs:
+      - start_notification
+      - release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Define variables
+        shell: bash
+        id: vars
+        run: |
+          set -v
+          end_timestamp=$(date +%s)
+          workflow_took=$(( ${end_timestamp} - ${{ needs.start_notification.outputs.start_timestamp }} ))
+          if [[ $(( ${workflow_took}/60 )) ]] ; then
+            echo "workflow_took=$(( ${workflow_took}/60 )) min  $(( ${workflow_took}%60 )) sec" >> $GITHUB_OUTPUT
+          else
+            echo "workflow_took=${workflow_took} sec" >> $GITHUB_OUTPUT
+          fi
+      - name: Finish notification
+        uses: 8398a7/action-slack@v3
+        if: always()
+        with:
+          status: custom
+          fields: workflow,message,author,took
+          custom_payload: |
+            {
+              attachments: [{
+                color: '${{ needs.release.result }}' === 'success' ? 'good' : 'danger',
+                pretext: '${{ needs.release.result }}' === 'success' ?
+                          `*App ${process.env.AS_WORKFLOW} \`success\`* ${[
+                              ':rotatingparrot:', ':party_sus:', ':sus_party:', ':party-parrot-hd:',
+                              ':github_parrot:', ':party_k8s:', ':9000:', ':corey:', ':corey-rolling:',
+                              ':happyhozez:', ':woohoo:', ':strawberry:', ':heart_eyes_cat:',
+                              ':sun_with_face:', ':dabcat:', ':first_place_medal:', ':flag-il:'
+                            ][Math.floor(Math.random() * 17)]} ${{ steps.vars.outputs.workflow_took }}` :
+                          `*App ${process.env.AS_WORKFLOW} \`failure\`* ${[
+                              ':pensive:', ':flushed:', ':see_no_evil:', ':octagonal_sign:',
+                              ':rain_cloud:', ':crossed_swords:', ':x:', ':bangbang:', ':sos:',
+                              ':failed:', ':silence_of_the_lamberth:', ':suspect:', ':waaagh:',
+                              ':ahh_dwight:', ':angry_cowboy:'
+                            ][Math.floor(Math.random() * 15)]} ${{ steps.vars.outputs.workflow_took }}`,
+                fields: [
+                  {
+                    value: `*Author:* ${process.env.AS_AUTHOR}`,
+                    short: false,
+                  },
+                  {
+                    value: `*Commit:* ${process.env.AS_MESSAGE}`,
+                    short: false,
+                  },
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url-prod }}

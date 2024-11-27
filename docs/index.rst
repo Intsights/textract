@@ -52,8 +52,6 @@ file types by either mentioning them on the `issue tracker
 
 * ``.eml`` via python builtins
 
-* ``.epub`` via `ebooklib`_
-
 * ``.gif`` via `tesseract-ocr`_
 
 * ``.jpg`` and ``.jpeg`` via `tesseract-ocr`_
@@ -93,7 +91,6 @@ file types by either mentioning them on the `issue tracker
 .. this is a list of all the packages that textract uses for extraction
 .. _antiword: http://www.winfield.demon.nl/
 .. _beautifulsoup4: http://beautiful-soup-4.readthedocs.org/en/latest/
-.. _ebooklib: https://github.com/aerkalov/ebooklib
 .. _msg-extractor: https://github.com/mattgwwalker/msg-extractor
 .. _pdfminer.six: https://github.com/goulu/pdfminer
 .. _pdftotext: http://poppler.freedesktop.org/
