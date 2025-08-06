@@ -1,0 +1,28 @@
+name: Sonarqube Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, closed]
+    branches:
+      - "**"
+    paths:
+      - "**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sonar-qube-check:
+    name: Static code analysis
+    runs-on: self-hosted
+    continue-on-error: true
+    steps:
+      - uses: Intsights/ti-github-actions/composite_actions/sonarqube@feat/asonn-plt-2676-sonarqube
+        with:
+          project_key: "textract"
+          src_path: "."
+          service_lang: "python""
+          token: ${{ secrets.SONARQUBE_TOKEN }}
+          token_global: ${{ secrets.SONARQUBE_GLOBAL_TOKEN }}
+          skip_quality_check: true
