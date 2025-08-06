@@ -22,7 +22,7 @@ jobs:
         with:
           project_key: "textract"
           src_path: "."
-          service_lang: "python""
+          service_lang: "python"
           token: ${{ secrets.SONARQUBE_TOKEN }}
           token_global: ${{ secrets.SONARQUBE_GLOBAL_TOKEN }}
           skip_quality_check: true
