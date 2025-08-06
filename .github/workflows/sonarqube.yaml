@@ -15,7 +15,7 @@ concurrency:
 jobs:
   sonar-qube-check:
     name: Static code analysis
-    runs-on: self-hosted
+    runs-on: arc-runner-set
     continue-on-error: true
     steps:
       - uses: Intsights/ti-github-actions/composite_actions/sonarqube@feat/asonn-plt-2676-sonarqube
